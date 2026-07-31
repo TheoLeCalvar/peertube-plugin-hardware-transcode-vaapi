@@ -152,9 +152,15 @@ function printResolution(resolution : VideoResolution) : string {
 
 function buildInitOptions() {
     if (pluginSettings.hardwareDecode) {
+        // -hwaccel combined with the encoder-only -vaapi_device flag fails to
+        // create a VA display on recent ffmpeg (tested on ffmpeg 7.1.5 / Debian
+        // trixie): "Device creation failed: -22". Explicitly initializing a
+        // named hw device and referencing it via -hwaccel_device is the
+        // syntax that actually works for combined hw decode + hw encode.
         return [
+            '-init_hw_device vaapi=va:/dev/dri/renderD128',
             '-hwaccel vaapi',
-            '-vaapi_device /dev/dri/renderD128',
+            '-hwaccel_device va',
             '-hwaccel_output_format vaapi',
         ]
     } else {
