@@ -1,6 +1,6 @@
 {
     "name": "peertube-plugin-hardware-transcode-vaapi",
-    "version": "0.2.9",
+    "version": "0.3.0",
     "license": "MIT",
     "description": "Plugin that adds transcode profiles which use VAAPI (Intel, AMD) or NVENC (NVIDIA) for hardware acceleration",
     "engine": {
