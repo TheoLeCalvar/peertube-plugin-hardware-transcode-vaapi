@@ -75,8 +75,9 @@ const vaapi : Backend = {
         ]
         : [`-vaapi_device ${pluginSettings.vaapiDevice}`],
     // software decode requires specifying pixel format for hardware filter and upload it to GPU
+    // hardware decode keeps the source pixel format (e.g. 10 bits), convert it to nv12 for h264
     scaleFilter: hardwareDecode => hardwareDecode
-        ? 'scale_vaapi'
+        ? 'scale_vaapi=format=nv12,scale_vaapi'
         : 'format=nv12,hwupload,scale_vaapi',
     qualityOptions: quality => [`-quality ${quality}`],
     outputOptions: (streamSuffix, targetBitrate) => [
@@ -102,7 +103,7 @@ const nvenc : Backend = {
             `-init_hw_device cuda=cu:${pluginSettings.cudaDevice}`,
             '-filter_hw_device cu',
         ],
-    // hardware decode keeps the source pixel format (e.g. 10 bits), h264_nvenc cannot encode 10 bits
+    // same as vaapi, h264_nvenc cannot encode 10 bits
     scaleFilter: hardwareDecode => hardwareDecode
         ? 'scale_cuda=format=nv12,scale_cuda'
         : 'format=nv12,hwupload_cuda,scale_cuda',
