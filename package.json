@@ -14,6 +14,10 @@
         "transcoding"
     ],
     "homepage": "https://github.com/TheoLeCalvar/peertube-plugin-hardware-transcode-vaapi",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/TheoLeCalvar/peertube-plugin-hardware-transcode-vaapi.git"
+    },
     "author": "gdsn",
     "bugs": "https://github.com/TheoLeCalvar/peertube-plugin-hardware-transcode-vaapi",
     "library": "./dist/main.js",

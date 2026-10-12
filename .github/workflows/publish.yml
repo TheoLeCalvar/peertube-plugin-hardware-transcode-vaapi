@@ -1,0 +1,39 @@
+name: Publish to npm
+
+# Publishes the plugin when a GitHub release is published (tag vX.Y.Z, matching package.json).
+# Uses npm trusted publishing: no npm token, the package must have this workflow configured
+# as trusted publisher on npmjs.com (Settings > Trusted publishing).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for npm trusted publishing and provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          # trusted publishing requires npm >= 11.5.1
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Check that the tag matches package.json version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::Release tag $TAG does not match package.json version $version"
+            exit 1
+          fi
+
+      # also builds dist/ through the prepare script
+      - run: npm ci
+
+      - run: npm publish
