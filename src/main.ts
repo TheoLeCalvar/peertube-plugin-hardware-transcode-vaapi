@@ -1,5 +1,7 @@
 import type { EncoderOptions, EncoderOptionsBuilderParams, PluginSettingsManager, PluginTranscodingManager, RegisterServerOptions, SettingValue } from "@peertube/peertube-types"
 import type { Logger } from 'winston'
+import { readFile } from 'fs/promises'
+import { basename } from 'path'
 
 // @peertube/peertube-types only ships type declarations, values must be defined here
 const VideoResolution = {
@@ -18,7 +20,13 @@ let logger : Logger
 let transcodingManager : PluginTranscodingManager
 
 const DEFAULT_HARDWARE_DECODE : boolean = false
-const DEFAULT_QUALITY : number = -1
+/**
+ * Encoder speed / quality tradeoff. Each backend (and VAAPI driver) translates it to its own scale,
+ * 'driver-default' sends nothing and lets the encoder pick.
+ */
+type QualityPreset = 'quality' | 'balanced' | 'speed' | 'driver-default'
+const QUALITY_PRESETS : QualityPreset[] = ['quality', 'balanced', 'speed', 'driver-default']
+const DEFAULT_QUALITY : QualityPreset = 'balanced'
 const DEFAULT_VAAPI_DEVICE : string = '/dev/dri/renderD128'
 const DEFAULT_CUDA_DEVICE : string = '0'
 const DEFAULT_BITRATES : Map<number, number> = new Map([
@@ -35,11 +43,17 @@ const DEFAULT_BITRATES : Map<number, number> = new Map([
 
 interface PluginSettings {
     hardwareDecode : boolean
-    quality: number
+    quality: QualityPreset
     vaapiDevice: string
     cudaDevice: string
     baseBitrate: Map<number, number>
 }
+// PCI vendor IDs of the GPUs supported by the vaapi profile
+const VENDOR_INTEL = '0x8086'
+const VENDOR_AMD = '0x1002'
+// vendor of the GPU behind the VAAPI device, used to pick the quality scale of its driver
+let vaapiVendor : string | undefined
+
 let pluginSettings : PluginSettings = {
     hardwareDecode: DEFAULT_HARDWARE_DECODE,
     quality: DEFAULT_QUALITY,
@@ -59,7 +73,7 @@ interface Backend {
     initOptions(hardwareDecode: boolean): string[]
     // PeerTube appends `=w=...:h=...` to this name
     scaleFilter(hardwareDecode: boolean): string
-    qualityOptions(quality: number): string[]
+    qualityOptions(quality: QualityPreset): string[]
     outputOptions(streamSuffix: string, targetBitrate: number): string[]
     liveOutputOptions(streamSuffix: string): string[]
 }
@@ -79,7 +93,11 @@ const vaapi : Backend = {
     scaleFilter: hardwareDecode => hardwareDecode
         ? 'scale_vaapi=format=nv12,scale_vaapi'
         : 'format=nv12,hwupload,scale_vaapi',
-    qualityOptions: quality => [`-quality ${quality}`],
+    // -quality is passed as is to the driver (VAEncMiscParameterBufferQualityLevel), each driver has its own scale
+    qualityOptions: quality => {
+        const level = vaapiQualityLevel(quality)
+        return level == undefined ? [] : [`-quality ${level}`]
+    },
     outputOptions: (streamSuffix, targetBitrate) => [
         `-b:v${streamSuffix} ${targetBitrate}`,
         `-bufsize ${targetBitrate * 2}`
@@ -107,8 +125,15 @@ const nvenc : Backend = {
     scaleFilter: hardwareDecode => hardwareDecode
         ? 'scale_cuda=format=nv12,scale_cuda'
         : 'format=nv12,hwupload_cuda,scale_cuda',
-    // plugin quality: 1 = best/slowest to 7 = fastest, nvenc presets: p1 = fastest to p7 = best/slowest
-    qualityOptions: quality => [`-preset p${quality < 1 || quality > 7 ? 4 : 8 - quality}`],
+    // nvenc presets: p1 = fastest to p7 = best/slowest, ffmpeg default is p4
+    qualityOptions: quality => {
+        switch (quality) {
+            case 'quality': return ['-preset p7']
+            case 'balanced': return ['-preset p4']
+            case 'speed': return ['-preset p1']
+            default: return []
+        }
+    },
     outputOptions: (streamSuffix, targetBitrate) => [
         // PeerTube forces -pix_fmt yuv420p, which h264_nvenc accepts, so ffmpeg would try to
         // convert the GPU frames back to system memory and fail. Keep the frames on the GPU.
@@ -125,6 +150,38 @@ const nvenc : Backend = {
 }
 
 const BACKENDS : Backend[] = [vaapi, nvenc]
+
+/**
+ * Translate the quality preset to the VAAPI driver's quality level, undefined to use the driver default.
+ */
+function vaapiQualityLevel(quality : QualityPreset) : number | undefined {
+    if (quality === 'driver-default') return undefined
+
+    switch (vaapiVendor) {
+        // Intel (iHD and i965): target usage, 1 = best quality to 7 = fastest, default 4.
+        // i965 on GPUs older than Skylake only has 1 and 2, ffmpeg clamps higher values to 2.
+        case VENDOR_INTEL:
+            return { quality: 1, balanced: 4, speed: 7 }[quality]
+        // AMD (Mesa): the level is a bitfield. Bit 0: valid, bits 1-2: preset (0 speed, 1 balanced, 2 quality,
+        // 3 high quality, VCN 4+ only, quality on older GPUs), bit 3: pre-encode, bit 4: VBAQ.
+        // 1 is special and means balanced + pre-encode + VBAQ, 0 means speed. Sending nothing also gives speed.
+        case VENDOR_AMD:
+            return { quality: 0b11111, balanced: 1, speed: 0 }[quality]
+        default:
+            return undefined
+    }
+}
+
+/**
+ * Read the PCI vendor of the GPU behind a DRM render node, e.g. /dev/dri/renderD128.
+ */
+async function readDrmVendor(device : string) : Promise<string | undefined> {
+    try {
+        return (await readFile(`/sys/class/drm/${basename(device)}/device/vendor`, 'utf8')).trim()
+    } catch {
+        return undefined
+    }
+}
 
 let latestStreamNum = 9999
 
@@ -174,19 +231,17 @@ export async function register({settingsManager, peertubeHelpers, transcodingMan
 
         type: 'select',
         options: [
-            { label: 'Automatic', value: '-1' },
-            { label: '1', value: '1' },
-            { label: '2', value: '2' },
-            { label: '3', value: '3' },
-            { label: '4', value: '4' },
-            { label: '5', value: '5' },
-            { label: '6', value: '6' },
-            { label: '7', value: '7' }
+            { label: 'Quality', value: 'quality' },
+            { label: 'Balanced', value: 'balanced' },
+            { label: 'Speed', value: 'speed' },
+            { label: 'Driver default', value: 'driver-default' }
         ],
 
-        descriptionHTML: 'This parameter controls the speed / quality tradeoff. Lower values mean better quality but slower encoding. Higher values mean faster encoding but lower quality.<br/>VAAPI: this setting is hardware dependent, you may need to experiment to find the best value for your hardware. Some hardware may have less than 7 levels of compression.<br/>NVENC: 1 to 7 map to presets p7 (slowest) to p1 (fastest), automatic uses p4.',
+        descriptionHTML: 'Encoder speed / quality tradeoff. It does not change the bitrate (set below), only how well the encoder uses it: <i>Quality</i> gives a better picture at the same file size but encodes slower, <i>Speed</i> is the fastest.'
+            + '<br/>The plugin translates it to the scale of your GPU: Intel target usage 1 / 4 / 7, AMD high quality / balanced / speed presets, NVIDIA presets p7 / p4 / p1. <i>Driver default</i> lets the driver choose (the speed preset on AMD).'
+            + '<br/>On Intel GPUs older than Skylake, <i>Balanced</i> is the same as <i>Speed</i>.',
 
-        default: DEFAULT_QUALITY.toString(),
+        default: DEFAULT_QUALITY,
         private: false
     })
     registerSetting({
@@ -257,11 +312,29 @@ function stringSetting(value : SettingValue | undefined, defaultValue : string) 
     return typeof value === 'string' && value.trim() !== '' ? value.trim() : defaultValue
 }
 
+// Versions up to 0.3.0 stored the VAAPI quality level of Intel GPUs: -1 (automatic) or 1 (best) to 7 (fastest).
+// Automatic becomes balanced: same as the Intel and NVIDIA defaults, and better than the AMD one (speed).
+function qualitySetting(value : SettingValue | undefined) : QualityPreset {
+    if (QUALITY_PRESETS.includes(value as QualityPreset)) return value as QualityPreset
+
+    const level = parseInt(value as string)
+    if (level >= 1 && level <= 2) return 'quality'
+    if (level >= 6 && level <= 7) return 'speed'
+    return DEFAULT_QUALITY
+}
+
 async function loadSettings(settingsManager: PluginSettingsManager) {
     pluginSettings.hardwareDecode = isTrue(await settingsManager.getSetting('hardware-decode'))
-    pluginSettings.quality = parseInt(await settingsManager.getSetting('quality') as string) || DEFAULT_QUALITY
+    const storedQuality = await settingsManager.getSetting('quality')
+    pluginSettings.quality = qualitySetting(storedQuality)
+    // store converted values of older versions, otherwise the select is blank in the settings page
+    if (storedQuality != undefined && storedQuality !== pluginSettings.quality) {
+        logger.info(`Converting quality setting ${storedQuality} to ${pluginSettings.quality}`)
+        await settingsManager.setSetting('quality', pluginSettings.quality)
+    }
     pluginSettings.vaapiDevice = stringSetting(await settingsManager.getSetting('vaapi-device'), DEFAULT_VAAPI_DEVICE)
     pluginSettings.cudaDevice = stringSetting(await settingsManager.getSetting('cuda-device'), DEFAULT_CUDA_DEVICE)
+    vaapiVendor = await readDrmVendor(pluginSettings.vaapiDevice)
 
     for (const [resolution, bitrate] of DEFAULT_BITRATES) {
         const key = `base-bitrate-${resolution}`
@@ -272,7 +345,11 @@ async function loadSettings(settingsManager: PluginSettingsManager) {
 
     logger.info(`Hardware decode: ${pluginSettings.hardwareDecode}`)
     logger.info(`Quality: ${pluginSettings.quality}`)
-    logger.info(`VAAPI device: ${pluginSettings.vaapiDevice}`)
+    logger.info(`VAAPI device: ${pluginSettings.vaapiDevice} (vendor ${vaapiVendor ?? 'unknown'})`)
+    if (vaapiVendor !== VENDOR_INTEL && vaapiVendor !== VENDOR_AMD) {
+        // not an error for NVENC users, the vaapi profile is not used
+        logger.info(`Unknown vendor for VAAPI device ${pluginSettings.vaapiDevice}, the vaapi profile uses the driver default quality`)
+    }
     logger.info(`CUDA device: ${pluginSettings.cudaDevice}`)
 }
 

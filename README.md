@@ -17,6 +17,25 @@ For more information on hardware acceleration:
 - https://trac.ffmpeg.org/wiki/HWAccelIntro
 
 
+# Quality setting
+
+The *Quality* setting picks the encoder's speed / quality tradeoff. It does not change the bitrate, which comes from the *Base bitrate* settings: *Quality* spends more GPU time to get a better picture at the same file size, *Speed* encodes the fastest.
+
+Each GPU vendor has its own scale, the plugin translates the preset to it:
+
+| Preset | Intel (VAAPI) | AMD (VAAPI) | NVIDIA (NVENC) |
+|---|---|---|---|
+| Quality | `-quality 1` (best target usage) | `-quality 31`: high quality preset (quality on GPUs older than RDNA3), pre-analysis, adaptive quantization | `-preset p7` |
+| Balanced (default) | `-quality 4` (driver default) | `-quality 1`: balanced preset, pre-analysis, adaptive quantization | `-preset p4` (ffmpeg default) |
+| Speed | `-quality 7` | `-quality 0`: speed preset | `-preset p1` |
+| Driver default | nothing sent (4) | nothing sent (speed preset) | nothing sent (p4) |
+
+For VAAPI, the vendor is read from `/sys/class/drm/renderD128/device/vendor` (for the configured *VAAPI device*). If it is neither Intel nor AMD, no quality option is sent.
+
+Intel GPUs older than Skylake using the `i965` driver only have two levels, 1 (quality) and 2 (speed): *Balanced* is the same as *Speed* there.
+
+Versions up to 0.3.0 had a 1 to 7 setting following the Intel scale, it is converted on upgrade: 1-2 to *Quality*, 6-7 to *Speed*, others (including *Automatic*) to *Balanced*.
+
 # Docker
 
 The official `chocobozzz/peertube:production` image already ships ffmpeg with VAAPI and NVENC support.
