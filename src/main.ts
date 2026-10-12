@@ -2,6 +2,7 @@ import type { EncoderOptions, EncoderOptionsBuilderParams, PluginSettingsManager
 import type { Logger } from 'winston'
 import { readFile } from 'fs/promises'
 import { basename } from 'path'
+import { spawn } from 'child_process'
 
 // @peertube/peertube-types only ships type declarations, values must be defined here
 const VideoResolution = {
@@ -185,6 +186,10 @@ async function readDrmVendor(device : string) : Promise<string | undefined> {
 
 let latestStreamNum = 9999
 
+// Hardware decode support per backend and input format, filled by testing each format on first use
+const hardwareDecodeSupport : Map<string, Promise<boolean>> = new Map()
+const HARDWARE_DECODE_TEST_TIMEOUT = 30_000
+
 export async function register({settingsManager, peertubeHelpers, transcodingManager: transcode, registerSetting} :RegisterServerOptions) {
     logger = peertubeHelpers.logger
     transcodingManager = transcode
@@ -220,7 +225,8 @@ export async function register({settingsManager, peertubeHelpers, transcodingMan
 
         type: 'input-checkbox',
 
-        descriptionHTML: 'Use hardware video decoder instead of software decoder. This will slightly improve performance but may cause some issues with some videos. If you encounter issues, disable this option and restart failed jobs.',
+        descriptionHTML: 'Decode videos on the GPU instead of the CPU, which reduces CPU usage and speeds up transcoding.'
+            + '<br/>The first time a video format (codec, profile, pixel format) is transcoded, the plugin checks whether the GPU can decode it, by decoding a few frames. Formats the GPU cannot decode (e.g. 10 bits H.264) use software decode. The result is logged and kept until the plugin settings change or PeerTube restarts.',
 
         default: DEFAULT_HARDWARE_DECODE,
         private: false
@@ -335,6 +341,8 @@ async function loadSettings(settingsManager: PluginSettingsManager) {
     pluginSettings.vaapiDevice = stringSetting(await settingsManager.getSetting('vaapi-device'), DEFAULT_VAAPI_DEVICE)
     pluginSettings.cudaDevice = stringSetting(await settingsManager.getSetting('cuda-device'), DEFAULT_CUDA_DEVICE)
     vaapiVendor = await readDrmVendor(pluginSettings.vaapiDevice)
+    // devices may have changed
+    hardwareDecodeSupport.clear()
 
     for (const [resolution, bitrate] of DEFAULT_BITRATES) {
         const key = `base-bitrate-${resolution}`
@@ -383,18 +391,86 @@ function shouldInitHardware(streamNum : number | undefined) : boolean {
     return shouldInit
 }
 
+/**
+ * Whether the input can be decoded by the GPU. When hardware decode is enabled, each input format
+ * (codec, profile, pixel format, size) is tested once per backend by decoding a few frames of the
+ * input with the hardware decode pipeline. Unsupported formats fall back to software decode.
+ */
+async function useHardwareDecode(backend : Backend, input : string, inputProbe : EncoderOptionsBuilderParams['inputProbe']) : Promise<boolean> {
+    if (!pluginSettings.hardwareDecode) return false
+
+    const video = inputProbe?.streams?.find(s => s.codec_type === 'video' && !s.disposition?.attached_pic)
+    // no probe (PeerTube < 6): test this input only
+    const format = video
+        ? `${video.codec_name} ${video.profile} ${video.pix_fmt}${Math.max(video.width ?? 0, video.height ?? 0) > 4096 ? ' >4K' : ''}`
+        : input
+    const key = `${backend.profile} ${format}`
+
+    let supported = hardwareDecodeSupport.get(key)
+    if (supported == undefined) {
+        supported = testHardwareDecode(backend, input, video?.index).then(result => {
+            if (result == undefined) {
+                logger.warn(`Hardware decode test of ${format} with ${backend.profile} timed out, using software decode`)
+            } else {
+                logger.info(`Hardware decode of ${format} with ${backend.profile}: ${result ? 'supported' : 'not supported, using software decode'}`)
+            }
+            // inconclusive results and inputs without probe are tested again next time
+            if (result == undefined || !video) hardwareDecodeSupport.delete(key)
+            return result ?? false
+        })
+        hardwareDecodeSupport.set(key, supported)
+    }
+    return supported
+}
+
+/**
+ * Decode and scale a few frames of the input with the hardware decode pipeline. When the GPU cannot decode the
+ * input, ffmpeg silently falls back to software decode and the hardware scale filter fails on the software frames.
+ * Resolves to undefined on timeout.
+ */
+function testHardwareDecode(backend : Backend, input : string, streamIndex : number | undefined) : Promise<boolean | undefined> {
+    const args = [
+        '-hide_banner', '-nostdin', '-loglevel', 'error',
+        ...backend.initOptions(true).flatMap(option => option.split(' ')),
+        '-i', input,
+        '-map', streamIndex == undefined ? '0:v:0' : `0:${streamIndex}`,
+        '-frames:v', '2',
+        '-vf', `${backend.scaleFilter(true)}=w=-2:h=144`,
+        '-f', 'null', '-'
+    ]
+
+    return new Promise(resolve => {
+        let stderr = ''
+        const ffmpeg = spawn(process.env.FFMPEG_PATH || 'ffmpeg', args, { stdio: [ 'ignore', 'ignore', 'pipe' ] })
+        const timeout = setTimeout(() => ffmpeg.kill('SIGKILL'), HARDWARE_DECODE_TEST_TIMEOUT)
+
+        ffmpeg.stderr.on('data', data => stderr += data)
+        ffmpeg.on('error', err => {
+            clearTimeout(timeout)
+            logger.warn(`Cannot run ffmpeg to test hardware decode: ${err.message}`)
+            resolve(false)
+        })
+        ffmpeg.on('close', code => {
+            clearTimeout(timeout)
+            if (code !== 0) logger.debug(`Hardware decode test failed (${code ?? 'timeout'}): ${stderr.trim()}`)
+            resolve(code == null ? undefined : code === 0)
+        })
+    })
+}
+
 async function vodBuilder(backend : Backend, params: EncoderOptionsBuilderParams) : Promise<EncoderOptions> {
-    const { resolution, fps, streamNum, inputBitrate } = params
+    const { input, inputProbe, resolution, fps, streamNum, inputBitrate } = params
     const streamSuffix = streamNum == undefined ? '' : `:${streamNum}`
     const targetBitrate = Math.min(getTargetBitrate(resolution, fps), inputBitrate)
+    const hardwareDecode = await useHardwareDecode(backend, input, inputProbe)
 
     logger.info(`Building ${backend.profile} encoder options, received ${JSON.stringify(params, ignoreProbe)}`)
 
     let options : EncoderOptions = {
         scaleFilter: {
-            name: backend.scaleFilter(pluginSettings.hardwareDecode)
+            name: backend.scaleFilter(hardwareDecode)
         },
-        inputOptions: shouldInitHardware(streamNum) ? backend.initOptions(pluginSettings.hardwareDecode) : [],
+        inputOptions: shouldInitHardware(streamNum) ? backend.initOptions(hardwareDecode) : [],
         outputOptions: [
             ...backend.qualityOptions(pluginSettings.quality),
             ...backend.outputOptions(streamSuffix, targetBitrate)
@@ -406,17 +482,18 @@ async function vodBuilder(backend : Backend, params: EncoderOptionsBuilderParams
 
 
 async function liveBuilder(backend : Backend, params: EncoderOptionsBuilderParams) : Promise<EncoderOptions> {
-    const { resolution, fps, streamNum, inputBitrate } = params
+    const { input, inputProbe, resolution, fps, streamNum, inputBitrate } = params
     const streamSuffix = streamNum == undefined ? '' : `:${streamNum}`
     const targetBitrate = Math.min(getTargetBitrate(resolution, fps), inputBitrate)
+    const hardwareDecode = await useHardwareDecode(backend, input, inputProbe)
 
     logger.info(`Building ${backend.profile} live encoder options, received ${JSON.stringify(params, ignoreProbe)}`)
 
     const options : EncoderOptions = {
         scaleFilter: {
-            name: backend.scaleFilter(pluginSettings.hardwareDecode)
+            name: backend.scaleFilter(hardwareDecode)
         },
-        inputOptions: shouldInitHardware(streamNum) ? backend.initOptions(pluginSettings.hardwareDecode) : [],
+        inputOptions: shouldInitHardware(streamNum) ? backend.initOptions(hardwareDecode) : [],
         outputOptions: [
             ...backend.qualityOptions(pluginSettings.quality),
             `-r:v${streamSuffix} ${fps}`,

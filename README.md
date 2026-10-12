@@ -36,6 +36,18 @@ Intel GPUs older than Skylake using the `i965` driver only have two levels, 1 (q
 
 Versions up to 0.3.0 had a 1 to 7 setting following the Intel scale, it is converted on upgrade: 1-2 to *Quality*, 6-7 to *Speed*, others (including *Automatic*) to *Balanced*.
 
+# Hardware decode setting
+
+When *Hardware decode* is enabled, videos are decoded on the GPU instead of the CPU. GPUs only decode some formats: for instance most of them cannot decode 10 bits H.264, and older ones cannot decode HEVC or 10 bits HEVC.
+
+The plugin does not rely on a list of GPUs and formats: the first time a video format (codec, profile, pixel format, and whether it is larger than 4K) is transcoded with a profile, it decodes and scales a few frames of the video with the hardware pipeline. If it fails, videos in this format use software decode. The result is logged, for instance:
+
+```
+Hardware decode of h264 High 10 yuv420p10le with nvenc: not supported, using software decode
+```
+
+Results are kept in memory until the plugin settings change or PeerTube restarts. The check takes less than a second per format.
+
 # Docker
 
 The official `chocobozzz/peertube:production` image already ships ffmpeg with VAAPI and NVENC support.
