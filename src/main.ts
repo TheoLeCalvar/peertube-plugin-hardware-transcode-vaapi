@@ -138,15 +138,15 @@ const nvenc : Backend = {
         // PeerTube forces -pix_fmt yuv420p, which h264_nvenc accepts, so ffmpeg would try to
         // convert the GPU frames back to system memory and fail. Keep the frames on the GPU.
         `-pix_fmt:v${streamSuffix} cuda`,
+        // ffmpeg < 8 defaults to main
+        `-profile:v${streamSuffix} high`,
         `-rc:v${streamSuffix} vbr`,
         `-b:v${streamSuffix} ${targetBitrate}`,
         `-maxrate:v${streamSuffix} ${targetBitrate}`,
         `-bufsize ${targetBitrate * 2}`
     ],
     // let nvenc pick the level, 3.1 is too low for resolutions above 720p30
-    liveOutputOptions: streamSuffix => [
-        `-profile:v${streamSuffix} high`
-    ]
+    liveOutputOptions: () => []
 }
 
 const BACKENDS : Backend[] = [vaapi, nvenc]
