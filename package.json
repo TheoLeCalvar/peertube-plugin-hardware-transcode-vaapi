@@ -2,13 +2,16 @@
     "name": "peertube-plugin-hardware-transcode-vaapi",
     "version": "0.2.9",
     "license": "MIT",
-    "description": "Plugin that adds transcode profiles which use vaapi for hardware acceleration",
+    "description": "Plugin that adds transcode profiles which use VAAPI (Intel, AMD) or NVENC (NVIDIA) for hardware acceleration",
     "engine": {
         "peertube": ">=5.1.0"
     },
     "keywords": [
         "peertube",
-        "plugin"
+        "plugin",
+        "vaapi",
+        "nvenc",
+        "transcoding"
     ],
     "homepage": "https://github.com/TheoLeCalvar/peertube-plugin-hardware-transcode-vaapi",
     "author": "gdsn",
@@ -28,7 +31,7 @@
         "watch": "npx tsc --build src/tsconfig.json --watch"
     },
     "devDependencies": {
-        "@peertube/peertube-types": "^5.1.0",
+        "@peertube/peertube-types": "^8.3.1",
         "@tsconfig/node16": "^1.0.3",
         "typescript": "^5.0.4"
     }
